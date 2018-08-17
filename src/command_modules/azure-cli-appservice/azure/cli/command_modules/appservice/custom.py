@@ -1064,8 +1064,7 @@ def create_app_service_plan(cmd, resource_group_name, name, is_linux, sku='B1', 
         _linux_sku_check(sku)
     # the api is odd on parameter naming, have to live with it for now
     sku_def = SkuDescription(tier=get_sku_name(sku), name=sku, capacity=number_of_workers)
-    plan_def = AppServicePlan(location, app_service_plan_name=name,
-                              sku=sku_def, reserved=(is_linux or None), tags=tags)
+    plan_def = AppServicePlan(location=location, sku=sku_def, reserved=(is_linux or None), tags=tags)
     return client.app_service_plans.create_or_update(resource_group_name, name, plan_def)
 
 
