@@ -226,6 +226,9 @@ class ExecutionResult(object):
 
         return self
 
+    def get_app_log(self):
+        return self.applog
+
     def get_output_in_json(self):
         if not self.json_value:
             self.json_value = json.loads(self.output)
