@@ -4,7 +4,22 @@
 # --------------------------------------------------------------------------------------------
 
 from __future__ import print_function
+import subprocess
 import threading
+import time
+
+import base64
+import paramiko
+import socket
+from paramiko.py3compat import u
+# windows does not have termios...
+try:
+    import termios
+    import tty
+
+    has_termios = True
+except ImportError:
+    has_termios = False
 
 try:
     from urllib.parse import urlparse
@@ -38,6 +53,8 @@ from azure.cli.core.commands.client_factory import get_mgmt_service_client
 from azure.cli.core.commands import LongRunningOperation
 from azure.cli.core.util import in_cloud_console
 from azure.cli.core.util import open_page_in_browser
+
+from .tunnel import TunnelServer
 
 from .vsts_cd_provider import VstsContinuousDeliveryProvider
 from ._params import AUTH_TYPES, MULTI_CONTAINER_TYPES, LINUX_RUNTIMES, WINDOWS_RUNTIMES
@@ -1019,7 +1036,6 @@ def config_source_control(cmd, resource_group_name, name, repo_url, repository_t
                 return LongRunningOperation(cmd.cli_ctx)(poller)
             except Exception as ex:  # pylint: disable=broad-except
                 import re
-                import time
                 ex = ex_handler_factory(no_throw=True)(ex)
                 # for non server errors(50x), just throw; otherwise retry 4 times
                 if i == 4 or not re.findall(r'\(50\d\)', str(ex)):
@@ -1225,7 +1241,7 @@ def list_snapshots(cmd, resource_group_name, name, slot=None):
                                    slot)
 
 
-def restore_snapshot(cmd, resource_group_name, name, time, slot=None, restore_content_only=False,
+def restore_snapshot(cmd, resource_group_name, name, time, slot=None, restore_content_only=False,  # pylint: disable=redefined-outer-name
                      source_resource_group=None, source_name=None, source_slot=None):
     from azure.cli.core.commands.client_factory import get_subscription_id
     client = web_client_factory(cmd.cli_ctx)
@@ -1568,7 +1584,6 @@ def show_cors(cmd, resource_group_name, name, slot=None):
 def get_streaming_log(cmd, resource_group_name, name, provider=None, slot=None):
     scm_url = _get_scm_url(cmd, resource_group_name, name, slot)
     streaming_url = scm_url + '/logstream'
-    import time
     if provider:
         streaming_url += ('/' + provider.lstrip('/'))
 
@@ -2009,7 +2024,6 @@ def list_locations(cmd, sku, linux_workers_enabled=None):
 
 def _check_zip_deployment_status(deployment_status_url, authorization, timeout=None):
     import requests
-    import time
     total_trials = (int(timeout) // 2) if timeout else 450
     for _num_trials in range(total_trials):
         time.sleep(2)
@@ -2231,3 +2245,107 @@ def _ping_scm_site(cmd, resource_group, name):
     import urllib3
     authorization = urllib3.util.make_headers(basic_auth='{}:{}'.format(user_name, password))
     requests.get(scm_url + '/api/settings', headers=authorization)
+
+
+def _check_for_ready_tunnel(tunnel_server):
+    return tunnel_server.is_port_set_to_default()
+
+
+def create_tunnel(cmd, resource_group_name, name, port=None, slot=None):
+    webapp = show_webapp(cmd, resource_group_name, name, slot)
+    is_linux = webapp.reserved
+    if not is_linux:
+        logger.error("Only Linux App Service Plans supported, Found a Windows App Service Plan")
+        return
+    profiles = list_publish_profiles(cmd, resource_group_name, name, slot)
+    user_name = next(p['userName'] for p in profiles)
+    user_password = next(p['userPWD'] for p in profiles)
+
+    if port is None:
+        port = 0  # Will auto-select a free port from 1024-65535
+        logger.info('No port defined, creating on random free port')
+    host_name = name
+
+    if slot is not None:
+        host_name += "-" + slot
+
+    tunnel_server = TunnelServer('', port, host_name, user_name, user_password)
+    _ping_scm_site(cmd, resource_group_name, name)
+
+    t = threading.Thread(target=_start_tunnel, args=(tunnel_server,))
+    t.daemon = True
+    t.start()
+
+    _wait_for_tunnel(tunnel_server, False)
+    
+    time.sleep(5)
+
+    s = threading.Thread(target=_start_ssh, args=('localhost', tunnel_server.get_port()))
+    s.daemon = True
+    s.start()
+
+    while s.isAlive() and t.isAlive():
+        time.sleep(5)
+
+
+def _wait_for_tunnel(tunnel_server, print_warnings):
+    if not _check_for_ready_tunnel(tunnel_server):
+        if print_warnings:
+            logger.warning('Tunnel is not ready yet, please wait (may take up to 1 minute)')
+        while True:
+            time.sleep(1)
+            if print_warnings:
+                logger.warning('.')
+            if _check_for_ready_tunnel(tunnel_server):
+                break
+
+
+def _start_tunnel(tunnel_server):
+    _wait_for_tunnel(tunnel_server, True)
+    logger.warning('SSH is available { username: root, password: Docker! }')
+    tunnel_server.start_server()
+
+
+def _start_ssh(host_name, port):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(hostname=host_name, port=port, username='root', password='Docker!')
+    channel = client.invoke_shell()
+    posix_shell(channel)
+    client.close()
+
+
+def ssh_webapp(cmd, resource_group_name, name, slot=None):  # pylint: disable=too-many-statements
+    create_tunnel(cmd, resource_group_name, name, port=None, slot=slot)
+
+
+def posix_shell(chan):
+    import select
+
+    oldtty = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        tty.setcbreak(sys.stdin.fileno())
+        chan.settimeout(0.0)
+        chan.send("bash")
+
+        while True:
+            r, w, e = select.select([chan, sys.stdin], [], [])
+            if chan in r:
+                try:
+                    x = u(chan.recv(1024))
+                    if len(x) == 0:
+                        sys.stdout.write("\r\n*** EOF\r\n")
+                        break
+                    sys.stdout.write(x)
+                    sys.stdout.flush()
+                except socket.timeout:
+                    pass
+            if sys.stdin in r:
+                x = sys.stdin.read(1)
+                if len(x) == 0:
+                    break
+                chan.send(x)
+
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, oldtty)
