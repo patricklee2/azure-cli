@@ -2296,7 +2296,7 @@ def _start_tunnel(tunnel_server):
 
 
 def _start_ssh(host_name, port, user_name):
-    subprocess.call("ssh -o StrictHostKeyChecking=no {}@{} -p {}".format(user_name, host_name, port), shell=True)
+    subprocess.call("ssh -A -vvv -o BatchMode=yes -o StrictHostKeyChecking=no {}@{} -p {} 2>&1".format(user_name, host_name, port), shell=True)
 
 
 def ssh_webapp(cmd, resource_group_name, name, slot=None):  # pylint: disable=too-many-statements
