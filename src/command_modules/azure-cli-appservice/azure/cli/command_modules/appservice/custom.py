@@ -21,6 +21,9 @@ import ssl
 import sys
 import OpenSSL.crypto
 
+import paramiko
+from . import interactive
+
 from knack.prompting import prompt_pass, NoTTYException
 from knack.util import CLIError
 from knack.log import get_logger
@@ -2314,13 +2317,14 @@ def _start_tunnel(tunnel_server):
     tunnel_server.start_server()
 
 
-def _start_ssh_session(host_name, port, user_name, user_password):
-    logger.warning("SSH username: %s, password: %s ", user_name, user_password)
-    while True:
-        #exit_code = subprocess.call("ssh -q -c aes128-cbc,3des-cbc,aes256-cbc -o StrictHostKeyChecking=no {}@{} -p {}".format(user_name, host_name, port), shell=True)
-        #if exit_code in [0, 130]: # success or ctrl+C
-        #    break
-        time.sleep(1)
+def _start_ssh_session(hostname, port, username, password):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(hostname, port, username, password)
+    chan = client.invoke_shell()
+    interactive.posix_shell(chan)
+    chan.close()
+    client.close()
 
 
 def ssh_webapp(cmd, resource_group_name, name, slot=None):  # pylint: disable=too-many-statements
